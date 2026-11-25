@@ -19,9 +19,10 @@ python3 naive-approach/PGP.py --scenario recovery   # setup + normal recovery on
 python3 naive-approach/PGP.py --scenario adv1       # curious server + one contact
 python3 naive-approach/PGP.py --scenario adv2       # malicious contact
 python3 naive-approach/PGP.py --scenario adv3       # false recovery request
+python3 naive-approach/PGP.py --brief              # same output, long keys/ciphertexts shortened
 ```
 
-Setup always runs first, because every scenario depends on it. A full run takes a few seconds. It ends with a summary of every check and exits with code `0` if all checks pass, or `1` if any fails.
+Setup always runs first, because every scenario depends on it. A full run takes a few seconds and prints every key (public and private), ciphertext, decryption result and everything posted to the server, so the output is long; add `--brief` to cut each long block down to a few lines. It ends with a summary of every check and exits with code `0` if all checks pass, or `1` if any fails.
 
 The script never touches your own `~/.gnupg`. Each actor gets its own temporary GnuPG home directory in the system temp folder: the user's old device, the new device, each contact, the attacker, and every short-lived keyring used to peel one layer. Each directory is deleted, and its `gpg-agent` stopped, as soon as it's no longer needed or when the script exits.
 

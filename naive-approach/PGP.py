@@ -51,16 +51,74 @@ from typing import Callable, Optional
 # Output helpers and expectation tracking
 # --------------------------------------------------------------------------- #
 
+WIDTH = 78
+BRIEF = False  # --brief: shorten long blocks (keys, ciphertexts) to a few lines
+
+
 def banner(title: str) -> None:
-    print("\n" + "=" * 78 + f"\n{title}\n" + "=" * 78)
+    print("\n\n" + "#" * WIDTH)
+    print(f"#  {title}")
+    print("#" * WIDTH)
 
 
 def step(msg: str) -> None:
-    print(f"\n-- {msg}")
+    print(f"\n\n{msg}\n" + "=" * min(len(msg), WIDTH))
+
+
+def substep(msg: str) -> None:
+    print(f"\n  {msg}\n  " + "-" * min(len(msg), WIDTH - 2))
 
 
 def info(msg: str, depth: int = 1) -> None:
     print("   " * depth + msg)
+
+
+def block(label: str, text: str, depth: int = 1, note: str = "") -> None:
+    """Print a multi-line value (key, ciphertext, plaintext) inside a frame."""
+    pad = "   " * depth
+    room = WIDTH - len(pad) - 2
+    lines = [l[i:i + room] for l in text.rstrip("\n").splitlines() for i in range(0, max(len(l), 1), room)]
+    lines = lines or [""]
+    if BRIEF and len(lines) > 7:
+        lines = lines[:4] + [f"... {len(lines) - 6} more lines (run without --brief to see all) ..."] + lines[-2:]
+    width = min(max(len(l) for l in lines) + 2, WIDTH - len(pad) - 1)
+    print()
+    print(f"{pad}{label}" + (f"  [{note}]" if note else ""))
+    print(f"{pad}+" + "-" * width)
+    for l in lines:
+        print(f"{pad}| {l}")
+    print(f"{pad}+" + "-" * width)
+
+
+def wrap(text: str, n: int = 64) -> str:
+    return "\n".join(text[i:i + n] for i in range(0, len(text), n))
+
+
+def show_bytes(label: str, data: bytes, depth: int = 1) -> None:
+    """Binary data (OpenPGP messages, keys) shown as wrapped base64."""
+    block(label, wrap(b64(data)), depth, f"{len(data)} bytes, base64")
+
+
+def show_text(label: str, data: bytes | str, depth: int = 1) -> None:
+    text = data.decode(errors="replace") if isinstance(data, bytes) else data
+    block(label, text, depth)
+
+
+def show_package(label: str, pkg: dict, depth: int = 1) -> None:
+    """A plaintext recovery package, one field per line."""
+    ct = pkg.get("ciphertext")
+    lines = [
+        f"backup_id    : {pkg.get('backup_id')}",
+        f"index        : {pkg.get('index')}",
+    ]
+    if ct is None:
+        lines.append("ciphertext   : (none)")
+    else:
+        lines.append(f"ciphertext   : ({len(b64d(ct))} bytes, base64)")
+        lines += ["  " + l for l in wrap(ct).splitlines()]
+    lines.append("recovery_key :")
+    lines += ["  " + l for l in str(pkg.get("recovery_key")).splitlines()]
+    block(label, "\n".join(lines), depth)
 
 
 def ok(msg: str, depth: int = 1) -> None:
@@ -86,7 +144,7 @@ def expect(description: str, condition: bool) -> None:
     """Record a property the simulation is supposed to demonstrate."""
     CHECKS.append((description, bool(condition)))
     marker = "CHECK PASSED" if condition else "CHECK FAILED"
-    print(f"   >> {marker}: {description}")
+    print(f"\n   >> {marker}: {description}")
 
 
 def b64(data: bytes) -> str:
@@ -285,12 +343,31 @@ class Server:
 
     def __init__(self) -> None:
         self.records: dict[str, BackupRecord] = {}
+        self.verbose = True  # print everything that is posted to the server
 
     def store_backup(self, record: BackupRecord) -> None:
         self.records[record.backup_id] = record
+        if self.verbose:
+            print()
+            info("[SERVER] <- POST backup record")
+            block("[SERVER] backup ID", record.backup_id, depth=2)
+            block("[SERVER] commitment", record.commitment, depth=2, note="SHA-256, hex")
+            show_bytes("[SERVER] encrypted backup", record.encrypted_backup, depth=2)
 
     def publish_package(self, backup_id: str, contact: str, blob: bytes) -> None:
         self.records[backup_id].packages[contact] = blob
+        if self.verbose:
+            print()
+            info(f"[SERVER] <- POST package for {contact} (backup ID {backup_id[:8]}...)")
+            show_bytes(f"[SERVER] package for {contact}, encrypted to P_{contact[0]}", blob, depth=2)
+
+    def dump(self, backup_id: str) -> None:
+        rec = self.records[backup_id]
+        block("backup ID", rec.backup_id)
+        block("commitment", rec.commitment, note="SHA-256, hex")
+        show_bytes("encrypted backup", rec.encrypted_backup)
+        for name, blob in rec.packages.items():
+            show_bytes(f"package for {name}", blob)
 
     def get_record(self, backup_id: str) -> BackupRecord:
         return self.records[backup_id]
@@ -320,6 +397,11 @@ class Contact:
     def public_key(self) -> bytes:
         return self.kr.export_public(self.fpr)
 
+    def show_keys(self) -> None:
+        substep(f"{self.name}  (P_{self.name[0]})  fingerprint {short_fpr(self.fpr)}")
+        show_text(f"{self.name}'s public key", self.public_key())
+        show_text(f"{self.name}'s private key", self.kr.export_secret(self.fpr))
+
     def read_fingerprint_aloud(self) -> str:
         """Out-of-band channel: in person, phone or video call."""
         return self.fpr
@@ -338,7 +420,8 @@ class Contact:
                         (None if the user says they never asked for a recovery).
         """
         offered_fpr = self.kr.fingerprint_of(offered_pub)
-        info(f"{self.name}: got a recovery request for key {short_fpr(offered_fpr)}")
+        substep(f"{self.name} handles the recovery request")
+        info(f"{self.name}: recovery request for key {short_fpr(offered_fpr)}")
 
         if verify_identity:
             spoken = call_user()
@@ -354,14 +437,21 @@ class Contact:
             info(f"{self.name}: !! forwarding WITHOUT any out-of-band identity check")
 
         package = self.open_own_package(server, backup_id)  # decrypt with own private key P_x
+        info(f"{self.name}: downloads their package from the server and decrypts it "
+             f"with P_{self.name[0]}")
+        show_package(f"{self.name}'s package, decrypted with P_{self.name[0]}", package)
         if self.tamper is not None:
             package = self.tamper(self, dict(package))
+            print()
             info(f"{self.name}: !! is malicious and sends a modified package")
+            show_package(f"modified package sent by {self.name}", package)
 
         imported = self.kr.import_key(offered_pub)
         if offered_fpr not in imported:
             raise GPGError("offered key could not be imported")
-        return self.kr.encrypt(json.dumps(package).encode(), [offered_fpr])
+        reply = self.kr.encrypt(json.dumps(package).encode(), [offered_fpr])
+        show_bytes(f"{self.name}'s reply, encrypted to the requester's key", reply)
+        return reply
 
 
 @contextmanager
@@ -412,22 +502,37 @@ def setup(server: Server, contacts: list[Contact], backup_plaintext: bytes,
     # OpenPGP symmetric encryption, AES-256 with integrity protection (MDC).
     encrypted_backup = device.sym_encrypt(envelope, master_key)
     commitment = commit(backup_id, master_key)
+    if verbose:
+        say(f"backup ID : {backup_id}")
+        block("master key mk", master_key.hex(), note="256 random bits, hex")
+        block("commitment = SHA-256(domain || backup ID || mk)", commitment, note="hex")
+        show_text("backup plaintext", backup_plaintext)
+        show_text("envelope that gets encrypted with mk (JSON: backup ID + base64 data)",
+                  json.dumps(json.loads(envelope), indent=2))
+        print()
+        say("the envelope is encrypted (OpenPGP, AES-256, key mk) and posted:")
     server.store_backup(BackupRecord(backup_id, encrypted_backup, commitment))
-    say(f"backup ID   : {backup_id}")
-    say(f"commitment  : SHA-256(...) = {commitment[:32]}...")
-    say(f"encrypted backup stored on server ({len(encrypted_backup)} bytes)")
 
     show("1.2 Recovery key pairs K1, K2, K3")
     K = {i: device.generate(f"Recovery key K{i} <recovery-{i}@{backup_id[:8]}>") for i in (1, 2, 3)}
     for i, fpr in K.items():
-        say(f"K{i}: {short_fpr(fpr)}")
+        if verbose:
+            substep(f"K{i}  fingerprint {short_fpr(fpr)}")
+            show_text(f"K{i} public key", device.export_public(fpr))
+            show_text(f"K{i} private key", device.export_secret(fpr))
 
     show("1.3 Threshold ciphertexts")
     mk_hex = master_key.hex().encode()
-    C_A = device.encrypt(device.encrypt(mk_hex, [K[2], K[3]]), [K[1]])
-    C_B = device.encrypt(device.encrypt(mk_hex, [K[3]]), [K[2]])
-    say(f"C_A = Enc_K1(Enc_{{K2,K3}}(mk))  ({len(C_A)} bytes)")
-    say(f"C_B = Enc_K2(Enc_K3(mk))        ({len(C_B)} bytes)")
+    inner_A = device.encrypt(mk_hex, [K[2], K[3]])
+    inner_B = device.encrypt(mk_hex, [K[3]])
+    C_A = device.encrypt(inner_A, [K[1]])
+    C_B = device.encrypt(inner_B, [K[2]])
+    if verbose:
+        show_bytes("inner layer of C_A: Enc_{K2,K3}(mk)", inner_A)
+        show_bytes("C_A = Enc_K1(Enc_{K2,K3}(mk))", C_A)
+        show_bytes("inner layer of C_B: Enc_K3(mk)", inner_B)
+        show_bytes("C_B = Enc_K2(Enc_K3(mk))", C_B)
+    del inner_A, inner_B
 
     show("1.4 Contact public keys, fingerprints confirmed out of band")
     P: dict[str, str] = {}
@@ -439,7 +544,7 @@ def setup(server: Server, contacts: list[Contact], backup_plaintext: bytes,
             raise SystemExit(f"fingerprint mismatch for {c.name}: aborting setup")
         device.import_key(pub)
         P[c.name] = fpr
-        say(f"P_{c.name[0]} ({c.name}): {short_fpr(fpr)}  [confirmed]")
+        say(f"P_{c.name[0]} ({c.name:<5}): {short_fpr(fpr)}  [confirmed]")
 
     show("1.5 Packages, each encrypted to its contact")
     for contact, idx, ct in ((alice, 1, C_A), (bob, 2, C_B), (carol, 3, None)):
@@ -450,9 +555,13 @@ def setup(server: Server, contacts: list[Contact], backup_plaintext: bytes,
             "ciphertext": b64(ct) if ct is not None else None,
         }
         blob = device.encrypt(json.dumps(package).encode(), [P[contact.name]])
-        server.publish_package(backup_id, contact.name, blob)
         what = f"K{idx}" + (f", C_{'AB'[idx - 1]}" if ct else "") + f", backup ID, index {idx}"
-        say(f"package {'ABC'[idx - 1]} -> {contact.name}: {what}  ({len(blob)} bytes, published)")
+        if verbose:
+            substep(f"package {'ABC'[idx - 1]} -> {contact.name}: {what}")
+            show_package(f"package {'ABC'[idx - 1]} (plaintext, before encryption)", package)
+            print()
+            say(f"package {'ABC'[idx - 1]} is encrypted to P_{contact.name[0]} and posted:")
+        server.publish_package(backup_id, contact.name, blob)
         del package
 
     show("1.6 Cleanup of the user's device")
@@ -508,11 +617,37 @@ class RecoveryClient:
     def public_key(self) -> bytes:
         return self.kr.export_public(self.fpr)
 
+    def show_keys(self, name: str = "N") -> None:
+        info(f"{self.owner}'s new key pair {name}: {short_fpr(self.fpr)}")
+        show_text(f"{name}_pub ({self.owner}'s new device)", self.public_key())
+        show_text(f"{name}_priv ({self.owner}'s new device)", self.kr.export_secret(self.fpr))
+
     def read_fingerprint_aloud(self) -> str:
         return self.fpr
 
     def destroy(self) -> None:
         self.kr.destroy()
+
+    def _summarize(self, pkg) -> str:
+        """Compact view of a decrypted reply (the full package was shown by the sender)."""
+        if not isinstance(pkg, dict):
+            return repr(pkg)[:200]
+        try:
+            key_fpr = short_fpr(self.kr.fingerprint_of(pkg["recovery_key"]))
+        except (GPGError, KeyError, TypeError, AttributeError):
+            key_fpr = "(no usable key)"
+        ct = pkg.get("ciphertext")
+        try:
+            ct_desc = ("(none)" if ct is None else
+                       f"{len(b64d(ct))} bytes, SHA-256 {hashlib.sha256(b64d(ct)).hexdigest()[:32]}...")
+        except (ValueError, TypeError):
+            ct_desc = "(not valid base64)"
+        return "\n".join([
+            f"backup_id    : {pkg.get('backup_id')}",
+            f"index        : {pkg.get('index')}",
+            f"recovery_key : fpr {key_fpr}",
+            f"ciphertext   : {ct_desc}",
+        ])
 
     # -- 2.4 validation of each reply -------------------------------------- #
     def _structural_problem(self, pkg) -> Optional[str]:
@@ -546,6 +681,7 @@ class RecoveryClient:
             except (GPGError, ValueError) as e:
                 rejected(f"reply from {sender}: cannot be decrypted/parsed ({e})")
                 continue
+            block(f"reply from {sender}, decrypted with N_priv", self._summarize(pkg))
             problem = self._structural_problem(pkg)
             if problem:
                 rejected(f"package from {sender}: {problem}")
@@ -567,8 +703,13 @@ class RecoveryClient:
     @staticmethod
     def _rebuild(lo: Candidate, hi: Candidate) -> bytes:
         assert lo.ciphertext is not None
+        ct_name = f"C_{'AB'[lo.index - 1]}"
+        show_bytes(f"{ct_name} (from {lo.sender}), the message to decrypt", lo.ciphertext, depth=2)
         middle = peel_layer(lo.ciphertext, lo.recovery_key, f"peel K{lo.index}")
+        show_bytes(f"{ct_name} decrypted with K{lo.index} ({lo.sender}): inner layer", middle, depth=2)
         inner = peel_layer(middle, hi.recovery_key, f"peel K{hi.index}")
+        block(f"inner layer decrypted with K{hi.index} ({hi.sender}): master key",
+              inner.decode("ascii", errors="replace"), depth=2, note="hex")
         mk = bytes.fromhex(inner.decode("ascii"))
         if len(mk) != 32:
             raise ValueError("rebuilt key has the wrong length")
@@ -577,8 +718,10 @@ class RecoveryClient:
     # -- 2.4 + 2.5 ----------------------------------------------------------- #
     def recover(self, replies: dict[str, Optional[bytes]]) -> RecoveryResult:
         record = self.server.get_record(self.backup_id)
+        substep("2.4 Decrypt and validate the replies")
         cands = self._validate(replies)
         if len(cands) < 2:
+            print()
             bad(f"only {len(cands)} valid package(s): recovery is NOT possible. Stopping.")
             return RecoveryResult(None)
 
@@ -586,6 +729,7 @@ class RecoveryClient:
         for a, b in itertools.combinations(cands, 2):
             lo, hi = sorted((a, b), key=lambda c: c.index)
             label = f"{lo.sender}(#{lo.index}) + {hi.sender}(#{hi.index})"
+            substep(f"2.4 Rebuild the master key: {label}")
             if lo.index == hi.index:
                 rejected(f"{label}: repeated index, pair not used")
                 continue
@@ -593,8 +737,12 @@ class RecoveryClient:
             try:
                 mk = self._rebuild(lo, hi)
             except (GPGError, ValueError, UnicodeDecodeError) as e:
+                print()
                 rejected(f"{label}: layers cannot be removed ({e})", depth=2)
                 continue
+            block("commitment check",
+                  f"stored on the server:\n  {record.commitment}\n"
+                  f"computed from the rebuilt key:\n  {commit(self.backup_id, mk)}", depth=2)
             if not hmac.compare_digest(commit(self.backup_id, mk), record.commitment):
                 rejected(f"{label}: rebuilt key does NOT match the stored commitment", depth=2)
                 continue
@@ -602,6 +750,7 @@ class RecoveryClient:
             passing.append((lo, hi, mk))
 
         if not passing:
+            print()
             bad("no pair yields a key that passes the commitment check: "
                 "recovery is NOT possible. Stopping without using any unverified key.")
             if len(cands) == 2:
@@ -614,19 +763,27 @@ class RecoveryClient:
             trusted = {c.sender for lo, hi, _ in passing for c in (lo, hi)}
             suspects = [c.sender for c in cands if c.sender not in trusted]
             if suspects:
+                print()
                 info(f"packages that appear in no verified pair -> malicious or corrupt: "
                      f"{', '.join(suspects)}")
 
         lo, hi, mk = passing[0]
-        step(f"2.5 Restore the backup with the verified key from {lo.sender} + {hi.sender}")
+        substep(f"2.5 Restore the backup with the verified key from {lo.sender} + {hi.sender}")
+        block("verified master key", mk.hex(), note="hex")
+        show_bytes("encrypted backup from the server (message to decrypt)",
+                   record.encrypted_backup)
         try:
-            envelope = json.loads(self.kr.sym_decrypt(record.encrypted_backup, mk))
+            raw = self.kr.sym_decrypt(record.encrypted_backup, mk)
+            envelope = json.loads(raw)
+            show_text("decrypted envelope", json.dumps(envelope, indent=2))
             if envelope.get("backup_id") != self.backup_id:
                 raise ValueError("backup ID inside the backup does not match")
             data = b64d(envelope["data"])
         except (GPGError, ValueError, KeyError) as e:
             bad(f"the backup failed to decrypt ({e}): stopping")
             return RecoveryResult(None, suspects)
+        show_text("restored backup (plaintext)", data)
+        print()
         ok(f"backup decrypted and integrity-verified ({len(data)} bytes)")
         return RecoveryResult(data, suspects)
 
@@ -637,15 +794,16 @@ def run_recovery(server: Server, outcome: SetupOutcome, ask: list[Contact],
     if title:
         step(title)
     client = RecoveryClient(server, outcome.backup_id)
-    info(f"2.1 new identity N on the new device: {short_fpr(client.fpr)}")
-    info(f"2.2/2.3 N_pub sent directly to {', '.join(c.name for c in ask)}; "
-         "they check it out of band and forward their package")
+    substep("2.1 New identity N on the new device")
+    client.show_keys()
+    print()
+    info(f"2.2/2.3 N_pub is sent directly to {', '.join(c.name for c in ask)};")
+    info("        they check it out of band and forward their package")
     replies = {
         c.name: c.handle_recovery_request(server, outcome.backup_id, client.public_key(),
                                           call_user=client.read_fingerprint_aloud)
         for c in ask
     }
-    info("2.4 rebuilding the master key")
     try:
         return client.recover(replies)
     finally:
@@ -705,12 +863,16 @@ def scenario_adv1(server: Server, outcome: SetupOutcome, contacts: list[Contact]
     step("What the server holds")
     info(f"encrypted backup ({len(rec.encrypted_backup)} B), backup ID, commitment, "
          f"packages for {', '.join(rec.packages)}")
+    server.dump(outcome.backup_id)
+    print()
     info("the commitment is SHA-256 of a 256-bit random key: not invertible / brute-forceable")
 
     for colluder in contacts:
         step(f"Server + {colluder.name}")
         pkg = colluder.open_own_package(server, outcome.backup_id)
         idx = pkg["index"]
+        show_package(f"{colluder.name}'s package, decrypted with P_{colluder.name[0]}", pkg)
+        print()
         info(f"{colluder.name} opens their own package: K{idx}"
              + (f" and C_{'AB'[idx - 1]}" if pkg["ciphertext"] else " (no ciphertext)"))
 
@@ -727,6 +889,8 @@ def scenario_adv1(server: Server, outcome: SetupOutcome, contacts: list[Contact]
             ct = b64d(pkg["ciphertext"])
             middle = peel_layer(ct, pkg["recovery_key"])
             info(f"outer layer of C_{'AB'[idx - 1]} removed with K{idx} -> inner ciphertext")
+            show_bytes(f"C_{'AB'[idx - 1]} after decrypting with K{idx}: still encrypted", middle)
+            print()
             try:
                 peel_layer(middle, pkg["recovery_key"])
                 bad("inner layer opened with the same key!")
@@ -794,7 +958,11 @@ def scenario_adv2(server: Server, outcome: SetupOutcome, contacts: list[Contact]
     want = outcome.sim_backup_plaintext
 
     step("(preparation) the user also protects a second, unrelated backup with the same contacts")
-    other = setup(server, contacts, b"another backup", verbose=False)
+    server.verbose = False
+    try:
+        other = setup(server, contacts, b"another backup", verbose=False)
+    finally:
+        server.verbose = True
     info(f"second backup ID: {other.backup_id}")
 
     with malicious(bob, tamper_wrong_backup(server, other.backup_id)):
@@ -846,7 +1014,7 @@ def scenario_adv3(server: Server, outcome: SetupOutcome, contacts: list[Contact]
 
     step("3a. Mallory poses as the user and sends her own key M_pub; contacts DO the check")
     mallory = RecoveryClient(server, bid, owner="Mallory")
-    info(f"Mallory's key M: {short_fpr(mallory.fpr)}")
+    mallory.show_keys("M")
     replies = {c.name: c.handle_recovery_request(server, bid, mallory.public_key(),
                                                  call_user=real_user_not_recovering)
                for c in (alice, bob)}
@@ -855,7 +1023,8 @@ def scenario_adv3(server: Server, outcome: SetupOutcome, contacts: list[Contact]
 
     step("3b. The user really is recovering, but sends N_pub via the server, which swaps in M_pub")
     user = RecoveryClient(server, bid)
-    info(f"user's real key N: {short_fpr(user.fpr)}; key delivered by the server: {short_fpr(mallory.fpr)}")
+    info(f"user's real key N        : {short_fpr(user.fpr)}")
+    info(f"key delivered by server  : {short_fpr(mallory.fpr)}  (Mallory's M)")
     replies = {c.name: c.handle_recovery_request(server, bid, mallory.public_key(),
                                                  call_user=user.read_fingerprint_aloud)
                for c in (alice, bob)}
@@ -882,7 +1051,11 @@ def scenario_adv3(server: Server, outcome: SetupOutcome, contacts: list[Contact]
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scenario", choices=["all", "recovery", "adv1", "adv2", "adv3"], default="all")
+    ap.add_argument("--brief", action="store_true",
+                    help="shorten long blocks (keys, ciphertexts) to a few lines")
     args = ap.parse_args()
+    global BRIEF
+    BRIEF = args.brief
 
     if shutil.which("gpg") is None or shutil.which("gpgconf") is None:
         print("GnuPG (gpg, gpgconf) must be installed and in PATH", file=sys.stderr)
@@ -893,7 +1066,7 @@ def main() -> int:
     step("Trusted contacts create their own PGP key pairs")
     contacts = [Contact(n) for n in ("Alice", "Bob", "Carol")]
     for c in contacts:
-        info(f"{c.name}: {short_fpr(c.fpr)}")
+        c.show_keys()
 
     backup = ("Family photos, password vault export, 2FA backup codes...\n"
               + secrets.token_hex(64)).encode()
@@ -901,6 +1074,7 @@ def main() -> int:
 
     step("The user loses the original device (master key and everything on it)")
     outcome.device.lose()
+    print()
     info("original device wiped; only the server's data and the contacts remain")
 
     scenarios = {
@@ -914,6 +1088,7 @@ def main() -> int:
             fn(server, outcome, contacts)
 
     banner("SUMMARY")
+    print()
     for desc, passed in CHECKS:
         print(f"  [{'PASS' if passed else 'FAIL'}] {desc}")
     failed = sum(not p for _, p in CHECKS)
