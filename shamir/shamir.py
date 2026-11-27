@@ -43,6 +43,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -287,18 +288,29 @@ class GPG:
                "--pinentry-mode", "loopback", "--no-symkey-cache", "--status-fd", "2"]
         fds: tuple[int, ...] = ()
         r = None
+        pw_file = None
         if passphrase is not None:
-            # Hand the passphrase to gpg through a pipe, never on the command line.
-            r, w = os.pipe()
-            os.write(w, passphrase.encode())
-            os.close(w)
-            cmd += ["--passphrase-fd", str(r)]
-            fds = (r,)
+            # Hand the passphrase to gpg through a pipe or a private file, never
+            # on the command line.
+            if os.name == "nt":
+                # Python can't pass a pipe to a child process on Windows, so the
+                # passphrase goes in a file inside this actor's private home,
+                # deleted as soon as gpg has read it.
+                pw_file = write_passphrase_file(self.home, passphrase.encode())
+                cmd += ["--passphrase-file", pw_file]
+            else:
+                r, w = os.pipe()
+                os.write(w, passphrase.encode())
+                os.close(w)
+                cmd += ["--passphrase-fd", str(r)]
+                fds = (r,)
         try:
             proc = subprocess.run(cmd + list(args), input=data, capture_output=True, pass_fds=fds)
         finally:
             if r is not None:
                 os.close(r)
+            if pw_file is not None:
+                os.remove(pw_file)
         err = proc.stderr.decode(errors="replace").splitlines()
         res = GPGResult(data=proc.stdout, returncode=proc.returncode,
                         statuses=[l[len("[GNUPG:] "):] for l in err if l.startswith("[GNUPG:] ")])
@@ -410,13 +422,32 @@ def new_home(name: str) -> GPG:
     return GPG(path)
 
 
+def write_passphrase_file(home: str, secret: bytes) -> str:
+    """Write `secret` to a new file only the current user can read; return its path."""
+    path = os.path.join(home, f"passphrase-{secrets.token_hex(8)}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    with os.fdopen(os.open(path, flags, 0o600), "wb") as fh:
+        fh.write(secret)
+    return path
+
+
+def remove_tree(path: str) -> None:
+    """Delete a directory. On Windows a gpg-agent that was just told to stop can
+    hold a file open for a moment, so retry for up to two seconds."""
+    for _ in range(20):
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.exists(path):
+            return
+        time.sleep(0.1)
+
+
 def wipe_home(gpg: GPG) -> None:
     """Stop the home's gpg-agent and delete the directory (models losing a device)."""
     path = gpg.home
     if path and os.path.isdir(path):
         subprocess.run(["gpgconf", "--homedir", path, "--kill", "all"], capture_output=True)
         subprocess.run(["gpgconf", "--homedir", path, "--remove-socketdir"], capture_output=True)
-        shutil.rmtree(path, ignore_errors=True)
+        remove_tree(path)
     if path in _HOMES:
         _HOMES.remove(path)
 
@@ -426,7 +457,7 @@ def _cleanup() -> None:
         subprocess.run(["gpgconf", "--homedir", path, "--kill", "all"], capture_output=True)
         subprocess.run(["gpgconf", "--homedir", path, "--remove-socketdir"], capture_output=True)
     if WORKDIR:
-        shutil.rmtree(WORKDIR, ignore_errors=True)
+        remove_tree(WORKDIR)
 
 
 atexit.register(_cleanup)

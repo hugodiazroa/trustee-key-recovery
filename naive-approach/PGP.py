@@ -40,6 +40,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from collections import Counter
 from contextlib import contextmanager
@@ -168,6 +169,25 @@ class GPGError(RuntimeError):
     pass
 
 
+def write_passphrase_file(home: str, secret: bytes) -> str:
+    """Write `secret` to a new file only the current user can read; return its path."""
+    path = os.path.join(home, f"passphrase-{secrets.token_hex(8)}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    with os.fdopen(os.open(path, flags, 0o600), "wb") as fh:
+        fh.write(secret)
+    return path
+
+
+def remove_tree(path: str) -> None:
+    """Delete a directory. On Windows a gpg-agent that was just told to stop can
+    hold a file open for a moment, so retry for up to two seconds."""
+    for _ in range(20):
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.exists(path):
+            return
+        time.sleep(0.1)
+
+
 class Keyring:
     """An isolated GnuPG home directory (a "device" or a scratch keyring)."""
 
@@ -201,9 +221,20 @@ class Keyring:
         return proc.stdout
 
     def _with_passphrase(self, key: bytes, *args: str, data: bytes) -> bytes:
-        # Hand the secret to gpg through a pipe, never on the command line.
+        # Hand the secret to gpg through a pipe or a private file, never on the
+        # command line.
+        secret = key.hex().encode()
+        if os.name == "nt":
+            # Python can't pass a pipe to a child process on Windows, so the
+            # passphrase goes in a file inside this keyring's private home,
+            # deleted as soon as gpg has read it.
+            path = write_passphrase_file(self.home, secret)
+            try:
+                return self._gpg("--passphrase-file", path, *args, data=data)
+            finally:
+                os.remove(path)
         r, w = os.pipe()
-        os.write(w, key.hex().encode())
+        os.write(w, secret)
         os.close(w)
         try:
             return self._gpg("--passphrase-fd", str(r), *args, data=data, pass_fds=(r,))
@@ -279,7 +310,7 @@ class Keyring:
         if self.home and os.path.isdir(self.home):
             subprocess.run(["gpgconf", "--homedir", self.home, "--kill", "all"], capture_output=True)
             subprocess.run(["gpgconf", "--homedir", self.home, "--remove-socketdir"], capture_output=True)
-            shutil.rmtree(self.home, ignore_errors=True)
+            remove_tree(self.home)
         self.home = None
         if self in Keyring._live:
             Keyring._live.remove(self)
