@@ -14,7 +14,59 @@ The repository has two simulations of this idea:
 Both simulations need the same things:
 
 - Python 3.10 or later. They use only the standard library.
-- GnuPG 2.2.8 or later, with `gpg` and `gpgconf` on your `PATH`. On Debian or Ubuntu, install it with `sudo apt install gnupg`.
+- GnuPG 2.2.8 or later, with `gpg` and `gpgconf` on your `PATH`.
+
+Check both with `python3 --version` and `gpg --version`.
+
+### Linux
+
+On Debian or Ubuntu, install GnuPG with `sudo apt install gnupg`. Then run the commands shown under each simulation below.
+
+### macOS
+
+1. Install [Homebrew](https://brew.sh) if you don't have it, then install Python and GnuPG:
+
+   ```bash
+   brew install python gnupg
+   ```
+
+2. Run the scripts with `TMPDIR=/tmp` in front of the command:
+
+   ```bash
+   TMPDIR=/tmp python3 naive-approach/PGP.py
+   TMPDIR=/tmp python3 shamir/shamir.py
+   ```
+
+   By default macOS puts temporary files in a long folder under `/var/folders/…`. GnuPG creates its agent sockets inside each temporary home, and macOS limits a socket path to 104 characters, so some homes go over the limit and `gpg-agent` won't start. `TMPDIR=/tmp` keeps the paths short. All the other options work the same way, for example `TMPDIR=/tmp python3 shamir/shamir.py --brief`.
+
+### Windows
+
+1. Install Python 3.10 or later from [python.org](https://www.python.org/downloads/windows/). In the installer, tick **Add python.exe to PATH**.
+2. Install [Gpg4win](https://gpg4win.org/download.html). It includes GnuPG and adds `gpg` and `gpgconf` to your `PATH`. You only need the GnuPG part, not Kleopatra or the Outlook plugin.
+
+   Both can also be installed from PowerShell with `winget install Python.Python.3.12 GnuPG.Gpg4win`.
+
+3. Open a **new** PowerShell or Command Prompt window, so it picks up the new `PATH`, and check the tools:
+
+   ```powershell
+   python --version
+   gpg --version
+   ```
+
+   If `gpg --version` shows a version older than 2.2.8, `where gpg` shows which `gpg` comes first on your `PATH`. Some other programs ship their own old copy.
+
+4. Go to the project folder and run the scripts with `python` and backslashes:
+
+   ```powershell
+   python naive-approach\PGP.py
+   python shamir\shamir.py --brief
+   ```
+
+   The options are the same as on Linux.
+
+On Linux and macOS the scripts hand each passphrase to `gpg` through a pipe. Python can't pass a pipe to a child process on Windows, so there they write the passphrase to a file in the actor's temporary GnuPG home, which only you can read, and delete it as soon as `gpg` has read it.
+
+The scripts also run in WSL (Windows Subsystem for Linux): install Ubuntu with `wsl --install`, then follow the Linux steps. Windows drives are under `/mnt`, so `C:\Users\you\trustee-key-recovery` is `/mnt/c/Users/you/trustee-key-recovery`.
 
 Neither script touches your own `~/.gnupg`. Each actor gets its own temporary GnuPG home directory in the system temp folder: the user's old device, the new device, each contact and the attacker. Each directory is deleted, and its `gpg-agent` stopped, as soon as it's no longer needed or when the script exits.
 
